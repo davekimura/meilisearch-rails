@@ -58,10 +58,10 @@ describe 'Settings change detection' do
 
   it 'does not detect settings changes' do
     expect(Color.send(:meilisearch_settings_changed?, {}, {})).to be(false)
-    expect(Color.send(:meilisearch_settings_changed?, { 'searchable_attributes' => ['name'] },
+    expect(Color.send(:meilisearch_settings_changed?, { 'searchableAttributes' => ['name'] },
                       { searchable_attributes: ['name'] })).to be(false)
     expect(Color.send(:meilisearch_settings_changed?,
-                      { 'searchable_attributes' => ['name'], 'ranking_rules' => ['words', 'typo', 'proximity', 'attribute', 'sort', 'exactness', 'hex:asc'] },
+                      { 'searchableAttributes' => ['name'], 'rankingRules' => ['words', 'typo', 'proximity', 'attribute', 'sort', 'exactness', 'hex:asc'] },
                       { 'ranking_rules' => ['words', 'typo', 'proximity', 'attribute', 'sort', 'exactness', 'hex:asc'] })).to be(false)
   end
 end
@@ -531,6 +531,18 @@ describe 'Book' do
     Book.index(safe_index_uid('Book')).delete_all_documents
   end
 
+  it 'returns array of tasks on #ms_index!' do
+    moby_dick = Book.create! name: 'Moby Dick', author: 'Herman Melville', premium: false, released: true
+
+    tasks = moby_dick.ms_index!
+
+    expect(tasks).to contain_exactly(
+      a_hash_including('uid'),
+      a_hash_including('taskUid'),
+      a_hash_including('taskUid')
+    )
+  end
+
   it 'indexes the book in 2 indexes of 3' do
     steve_jobs = Book.create! name: 'Steve Jobs', author: 'Walter Isaacson', premium: true, released: true
     results = Book.search('steve')
@@ -616,6 +628,34 @@ describe 'Book' do
     expect(results.size).to eq(1)
   end
 
+  describe '#ms_entries' do
+    it 'returns all 3 indexes for a public book' do
+      book = Book.create!(
+        name: 'Frankenstein', author: 'Mary Shelley',
+        premium: false, released: true
+      )
+
+      expect(book.ms_entries).to contain_exactly(
+        a_hash_including("index_uid" => safe_index_uid('SecuredBook')),
+        a_hash_including("index_uid" => safe_index_uid('BookAuthor')),
+        a_hash_including("index_uid" => safe_index_uid('Book')),
+      )
+    end
+
+    it 'returns all 3 indexes for a non-public book' do
+      book = Book.create!(
+        name: 'Frankenstein', author: 'Mary Shelley',
+        premium: false, released: false
+      )
+
+      expect(book.ms_entries).to contain_exactly(
+        a_hash_including("index_uid" => safe_index_uid('SecuredBook')),
+        a_hash_including("index_uid" => safe_index_uid('BookAuthor')),
+        a_hash_including("index_uid" => safe_index_uid('Book')),
+      )
+    end
+  end
+
   it 'returns facets using max values per facet' do
     10.times do
       Book.create! name: Faker::Book.title, author: Faker::Book.author, genre: Faker::Book.genre
@@ -627,6 +667,21 @@ describe 'Book' do
 
     expect(genres.size).to be > 3
     expect(results.facets_distribution['genre'].size).to eq(3)
+  end
+
+  it 'does not error on facet_search' do
+    genres = %w[Legend Fiction Crime].cycle
+    authors = %w[A B C].cycle
+
+    5.times do
+      Book.create! name: Faker::Book.title, author: authors.next, genre: genres.next
+    end
+
+    expect do
+      Book.index.facet_search('genre', 'Fic', filter: 'author = A')
+      Book.index.facet_search('genre', filter: 'author = A')
+      Book.index.facet_search('genre')
+    end.not_to raise_error
   end
 
   context 'with Marshal serialization' do
@@ -674,6 +729,14 @@ end
 describe 'Movie' do
   before(:all) do
     Movie.clear_index!(true)
+  end
+
+  it 'returns array of single task hash on #ms_index!' do
+    movie = Movie.create(title: 'Harry Potter')
+
+    task = movie.ms_index!
+
+    expect(task).to contain_exactly(a_hash_including('taskUid'))
   end
 
   it 'does not return any record with typo' do
@@ -803,12 +866,13 @@ describe 'with pagination by pagy' do
     Movie.create(title: 'Harry Potter').index!(true)
 
     logger = double
-    allow(logger).to receive(:warning)
+
+    allow(logger).to receive(:warn)
     allow(MeiliSearch::Rails).to receive(:logger).and_return(logger)
 
     Movie.search('')
 
-    expect(logger).to have_received(:warning)
+    expect(logger).to have_received(:warn)
       .with('[meilisearch-rails] Remove `pagination_backend: :pagy` from your initializer, `pagy` it is not required for `pagy`')
   end
 end
@@ -882,6 +946,12 @@ unless OLD_RAILS
   end
 
   describe 'DisabledEnqueuedDocument' do
+    it '#ms_index! returns an empty array' do
+      doc = DisabledEnqueuedDocument.create! name: 'test'
+
+      expect(doc.ms_index!).to be_empty
+    end
+
     it 'does not try to enqueue a job' do
       expect do
         DisabledEnqueuedDocument.create! name: 'test'
@@ -890,7 +960,10 @@ unless OLD_RAILS
   end
 
   describe 'ConditionallyEnqueuedDocument' do
-    before { allow(MeiliSearch::Rails::MSJob).to receive(:perform_later).and_return(nil) }
+    before do
+      allow(MeiliSearch::Rails::MSJob).to receive(:perform_later).and_return(nil)
+      allow(MeiliSearch::Rails::MSCleanUpJob).to receive(:perform_later).and_return(nil)
+    end
 
     it 'does not try to enqueue an index job when :if option resolves to false' do
       doc = ConditionallyEnqueuedDocument.create! name: 'test', is_public: false
@@ -910,7 +983,7 @@ unless OLD_RAILS
 
       doc.destroy!
 
-      expect(MeiliSearch::Rails::MSJob).to have_received(:perform_later).with(doc, 'ms_remove_from_index!')
+      expect(MeiliSearch::Rails::MSCleanUpJob).to have_received(:perform_later).with(doc.ms_entries)
     end
   end
 end
@@ -1007,6 +1080,19 @@ describe 'Animals' do
 
     expect(cat_index).to eq(dog_index)
   end
+
+  describe '#ms_entries' do
+    it 'returns the correct entry for each animal' do
+      toby_dog = Dog.create!(name: 'Toby the Dog')
+      taby_cat = Cat.create!(name: 'Taby the Cat')
+
+      expect(toby_dog.ms_entries).to contain_exactly(
+        a_hash_including('primary_key' => /dog_\d+/))
+
+      expect(taby_cat.ms_entries).to contain_exactly(
+        a_hash_including('primary_key' => /cat_\d+/))
+    end
+  end
 end
 
 describe 'Songs' do
@@ -1050,11 +1136,13 @@ describe 'Raise on failure' do
     let(:index_instance) { instance_double(MeiliSearch::Index, settings: nil, update_settings: nil) }
     let(:slow_client) { instance_double(MeiliSearch::Client, index: index_instance) }
 
+    before do
+      allow(slow_client).to receive(:create_index)
+      allow(MeiliSearch::Rails).to receive(:client).and_return(slow_client)
+    end
+
     it 'does not raise error timeouts on reindex' do
       allow(index_instance).to receive(:add_documents).and_raise(MeiliSearch::TimeoutError)
-      allow(slow_client).to receive(:create_index).and_return(index_instance)
-
-      allow(MeiliSearch::Rails).to receive(:client).and_return(slow_client)
 
       expect do
         Vegetable.create(name: 'potato')
@@ -1062,10 +1150,7 @@ describe 'Raise on failure' do
     end
 
     it 'does not raise error timeouts on data addition' do
-      allow(slow_client).to receive(:create_index).and_raise(MeiliSearch::TimeoutError)
       allow(index_instance).to receive(:add_documents).and_return(nil)
-
-      allow(MeiliSearch::Rails).to receive(:client).and_return(slow_client)
 
       expect do
         Vegetable.ms_reindex!

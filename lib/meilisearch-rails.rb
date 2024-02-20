@@ -249,6 +249,7 @@ module MeiliSearch
       # lazy load the ActiveJob class to ensure the
       # queue is initialized before using it
       autoload :MSJob, 'meilisearch/rails/ms_job'
+      autoload :MSCleanUpJob, 'meilisearch/rails/ms_clean_up_job'
     end
 
     # this class wraps an MeiliSearch::Index document ensuring all raised exceptions
@@ -282,6 +283,15 @@ module MeiliSearch
         end
       end
 
+      # Maually define facet_search due to complications with **opts in ruby 2.*
+      def facet_search(*args, **opts)
+        SafeIndex.log_or_throw(:facet_search, @raise_on_failure) do
+          return MeiliSearch::Rails.black_hole unless MeiliSearch::Rails.active?
+
+          @index.facet_search(*args, **opts)
+        end
+      end
+
       # special handling of wait_for_task to handle null task_id
       def wait_for_task(task_uid)
         return if task_uid.nil? && !@raise_on_failure # ok
@@ -296,7 +306,7 @@ module MeiliSearch
         SafeIndex.log_or_throw(:settings, @raise_on_failure) do
           @index.settings(*args)
         rescue ::MeiliSearch::ApiError => e
-          return {} if e.code == 404 # not fatal
+          return {} if e.code == 'index_not_found' # not fatal
 
           raise e
         end
@@ -373,7 +383,11 @@ module MeiliSearch
 
           proc = if options[:enqueue] == true
                    proc do |record, remove|
-                     MSJob.perform_later(record, remove ? 'ms_remove_from_index!' : 'ms_index!')
+                     if remove
+                       MSCleanUpJob.perform_later(record.ms_entries)
+                     else
+                       MSJob.perform_later(record, 'ms_index!')
+                     end
                    end
                  elsif options[:enqueue].respond_to?(:call)
                    options[:enqueue]
@@ -445,7 +459,7 @@ module MeiliSearch
               end
             end
           elsif respond_to?(:after_destroy)
-            after_destroy { |searchable| searchable.ms_enqueue_remove_from_index!(ms_synchronous?) }
+            after_destroy_commit { |searchable| searchable.ms_enqueue_remove_from_index!(ms_synchronous?) }
           end
         end
 
@@ -526,7 +540,8 @@ module MeiliSearch
       def ms_index!(document, synchronous = false)
         return if ms_without_auto_index_scope
 
-        ms_configurations.each do |options, settings|
+        # MS tasks to be returned
+        ms_configurations.map do |options, settings|
           next if ms_indexing_disabled?(options)
 
           primary_key = ms_primary_key_of(document, options)
@@ -550,8 +565,20 @@ module MeiliSearch
               index.delete_document(primary_key)
             end
           end
+        end.compact
+      end
+
+      def ms_entries_for(document:, synchronous:)
+        primary_key = ms_primary_key_of(document)
+        raise ArgumentError, 'Cannot index a record without a primary key' if primary_key.blank?
+
+        ms_configurations.filter_map do |options, settings|
+          {
+            synchronous: synchronous || options[:synchronous],
+            index_uid: options[:index_uid],
+            primary_key: primary_key
+          }.with_indifferent_access unless ms_indexing_disabled?(options)
         end
-        nil
       end
 
       def ms_remove_from_index!(document, synchronous = false)
@@ -735,33 +762,38 @@ module MeiliSearch
 
       protected
 
-      def ms_ensure_init(options = nil, settings = nil, index_settings = nil)
+      def ms_ensure_init(options = meilisearch_options, settings = meilisearch_settings, user_configuration = settings.to_settings)
         raise ArgumentError, 'No `meilisearch` block found in your model.' if meilisearch_settings.nil?
 
         @ms_indexes ||= { true => {}, false => {} }
 
-        options ||= meilisearch_options
-        settings ||= meilisearch_settings
+        @ms_indexes[MeiliSearch::Rails.active?][settings] ||= SafeIndex.new(ms_index_uid(options), meilisearch_options[:raise_on_failure], meilisearch_options)
 
-        return @ms_indexes[MeiliSearch::Rails.active?][settings] if @ms_indexes[MeiliSearch::Rails.active?][settings]
-
-        @ms_indexes[MeiliSearch::Rails.active?][settings] = SafeIndex.new(ms_index_uid(options), meilisearch_options[:raise_on_failure], meilisearch_options)
-
-        current_settings = @ms_indexes[MeiliSearch::Rails.active?][settings].settings(getVersion: 1) rescue nil # if the index doesn't exist
-
-        index_settings ||= settings.to_settings
-        index_settings = options[:primary_settings].to_settings.merge(index_settings) if options[:inherit]
-
-        options[:check_settings] = true if options[:check_settings].nil?
-
-        if !ms_indexing_disabled?(options) && options[:check_settings] && meilisearch_settings_changed?(current_settings, index_settings)
-          @ms_indexes[MeiliSearch::Rails.active?][settings].update_settings(index_settings)
-        end
+        update_settings_if_changed(@ms_indexes[MeiliSearch::Rails.active?][settings], options, user_configuration)
 
         @ms_indexes[MeiliSearch::Rails.active?][settings]
       end
 
       private
+
+      def update_settings_if_changed(index, options, user_configuration)
+        server_state = index.settings
+        user_configuration = options[:primary_settings].to_settings.merge(user_configuration) if options[:inherit]
+
+        config = user_configuration.except(:attributes_to_highlight, :attributes_to_crop, :crop_length)
+
+        if !skip_checking_settings?(options) && meilisearch_settings_changed?(server_state, config)
+          index.update_settings(user_configuration)
+        end
+      end
+
+      def skip_checking_settings?(options)
+        ms_indexing_disabled?(options) || ms_checking_disabled?(options)
+      end
+
+      def ms_checking_disabled?(options)
+        options[:check_settings] == false
+      end
 
       def ms_configurations
         raise ArgumentError, 'No `meilisearch` block found in your model.' if meilisearch_settings.nil?
@@ -800,19 +832,22 @@ module MeiliSearch
         options[:primary_key] || MeiliSearch::Rails::IndexSettings::DEFAULT_PRIMARY_KEY
       end
 
-      def meilisearch_settings_changed?(prev, current)
-        return true if prev.nil?
+      def meilisearch_settings_changed?(server_state, user_configuration)
+        return true if server_state.nil?
 
-        current.each do |k, v|
-          prev_v = prev[k.to_s]
-          if v.is_a?(Array) && prev_v.is_a?(Array)
-            # compare array of strings, avoiding symbols VS strings comparison
-            return true if v.map(&:to_s) != prev_v.map(&:to_s)
-          elsif prev_v != v
-            return true
+        user_configuration.transform_keys! { |key| key.to_s.camelize(:lower) }
+
+        user_configuration.any? do |key, user|
+          server = server_state[key]
+
+          if user.is_a?(Hash) && server.is_a?(Hash)
+            meilisearch_settings_changed?(server, user)
+          elsif user.is_a?(Array) && server.is_a?(Array)
+            user.map(&:to_s).sort! != server.map(&:to_s).sort!
+          else
+            user.to_s != server.to_s
           end
         end
-        false
       end
 
       def ms_conditional_index?(options = nil)
@@ -921,6 +956,10 @@ module MeiliSearch
 
       def ms_synchronous?
         @ms_synchronous
+      end
+
+      def ms_entries(synchronous = false)
+        self.class.ms_entries_for(document: self, synchronous: synchronous || ms_synchronous?)
       end
 
       private
